@@ -1,0 +1,130 @@
+#!/bin/bash
+#
+# Script to deploy a Python 2.7 application on Ubuntu 18.04 in AWS EC2
+#
+# **Important:**
+# * This script assumes you have the AWS CLI configured.
+# * It uses Ubuntu 18.04.
+# * Python 2.7 is end-of-life and poses security risks.  Migrate to Python 3.x if possible.
+# * The script creates a new security group if one with the specified name does not exist
+#
+# **Variables to customize:**
+#
+AWS_REGION="your_aws_region"       # e.g., us-east-1
+AMI_ID="your_ubuntu_1804_ami_id" # e.g., ami-xxxxxxxxxxxxxxxxx (find this in the EC2 console)
+INSTANCE_TYPE="t3.micro"         # e.g., t3.micro, t3.small
+KEY_NAME="your_key_pair_name"       # The name of your EC2 key pair
+SECURITY_GROUP_NAME="python27-app-sg" # The name of the security group to create/use
+APP_NAME="my-python-app"            # Name of your application
+#
+# Optional variables
+#
+INSTANCE_PROFILE_NAME="" #Set this only if your application needs an IAM role
+#
+# Functions
+#
+create_security_group() {
+  echo "Creating security group: $SECURITY_GROUP_NAME"
+  # Check if the security group already exists
+  if aws ec2 describe-security-groups --region "$AWS_REGION" --filters "Name=group-name,Values=$SECURITY_GROUP_NAME" | grep -q "GroupId"; then
+    echo "Security group '$SECURITY_GROUP_NAME' already exists. Using it."
+    SECURITY_GROUP_ID=$(aws ec2 describe-security-groups --region "$AWS_REGION" --filters "Name=group-name,Values=$SECURITY_GROUP_NAME" --query "SecurityGroups[0].GroupId" --output text)
+  else
+    SECURITY_GROUP_ID=$(aws ec2 create-security-group --region "$AWS_REGION" --group-name "$SECURITY_GROUP_NAME" --description "Security group for Python 2.7 web application" --output text)
+    echo "Security group ID: $SECURITY_GROUP_ID"
+    # Add rules to the security group
+    aws ec2 authorize-security-group-ingress --region "$AWS_REGION" --group-id "$SECURITY_GROUP_ID" --protocol tcp --port 22 --cidr 0.0.0.0/0 # SSH
+    aws ec2 authorize-security-group-ingress --region "$AWS_REGION" --group-id "$SECURITY_GROUP_ID" --protocol tcp --port 80 --cidr 0.0.0.0/0 # HTTP
+    echo "Security group rules added."
+  fi
+}
+
+launch_instance() {
+  echo "Launching EC2 instance..."
+  if [ -n "$INSTANCE_PROFILE_NAME" ]; then
+      INSTANCE_ID=$(aws ec2 run-instances --region "$AWS_REGION" --image-id "$AMI_ID" --instance-type "$INSTANCE_TYPE" --key-name "$KEY_NAME" --security-group-ids "$SECURITY_GROUP_ID" --associate-public-ip-address --iam-instance-profile "Name=$INSTANCE_PROFILE_NAME" --query "Instances[0].InstanceId" --output text)
+  else
+      INSTANCE_ID=$(aws ec2 run-instances --region "$AWS_REGION" --image-id "$AMI_ID" --instance-type "$INSTANCE_TYPE" --key-name "$KEY_NAME" --security-group-ids "$SECURITY_GROUP_ID" --associate-public-ip-address --query "Instances[0].InstanceId" --output text)
+  fi
+
+
+  echo "Instance ID: $INSTANCE_ID"
+  echo "Waiting for instance to start..."
+  aws ec2 wait instance-running --region "$AWS_REGION" --instance-ids "$INSTANCE_ID"
+  PUBLIC_DNS=$(aws ec2 describe-instances --region "$AWS_REGION" --instance-ids "$INSTANCE_ID" --query "Reservations[0].Instances[0].PublicDnsName" --output text)
+  echo "Instance is running. Public DNS: $PUBLIC_DNS"
+}
+
+configure_server() {
+  echo "Configuring server..."
+  # Use sshpass to avoid interactive password prompts (less secure, but simpler for scripting)
+  # If you have sshpass not installed, you can install with: sudo apt install sshpass -y
+  # Or you can use public key, which is more secure, but more complex to script.
+  # Update package lists
+  ssh -o StrictHostKeyChecking=no -i "$KEY_NAME".pem ubuntu@"$PUBLIC_DNS" "sudo apt update -y"
+  ssh -o StrictHostKeyChecking=no -i "$KEY_NAME".pem ubuntu@"$PUBLIC_DNS" "sudo apt upgrade -y"
+  # Install Python 2.7 and pip
+  ssh -o StrictHostKeyChecking=no -i "$KEY_NAME".pem ubuntu@"$PUBLIC_DNS" "sudo apt install python2.7 python2.7-dev -y"
+  ssh -o StrictHostKeyChecking=no -i "$KEY_NAME".pem ubuntu@"$PUBLIC_DNS" "sudo apt install python-pip -y"
+  ssh -o StrictHostKeyChecking=no -i "$KEY_NAME".pem ubuntu@"$PUBLIC_DNS" "sudo pip install virtualenv"
+  # Create application directory and virtual environment
+  ssh -o StrictHostKeyChecking=no -i "$KEY_NAME".pem ubuntu@"$PUBLIC_DNS" "sudo mkdir -p /var/www/$APP_NAME"
+  ssh -o StrictHostKeyChecking=no -i "$KEY_NAME".pem ubuntu@"$PUBLIC_DNS" "sudo chown -R ubuntu:www-data /var/www/$APP_NAME"
+  ssh -o StrictHostKeyChecking=no -i "$KEY_NAME".pem ubuntu@"$PUBLIC_DNS" "cd /var/www/$APP_NAME && virtualenv venv"
+
+  # Install Flask (if you don't have a specific app)
+  ssh -o StrictHostKeyChecking=no -i "$KEY_NAME".pem ubuntu@"$PUBLIC_DNS" "cd /var/www/$APP_NAME && source venv/bin/activate && pip install Flask"
+  # Create the app.py file
+  cat <<EOF | ssh -o StrictHostKeyChecking=no -i "$KEY_NAME".pem ubuntu@"$PUBLIC_DNS" "sudo tee /var/www/$APP_NAME/app.py"
+from flask import Flask
+app = Flask(__name__)
+
+@app.route("/")
+def hello():
+    return "Hello, World!  This is Python 2.7!"
+
+if __name__ == "__main__":
+    #  Remove this app.run() when using Gunicorn
+    # app.run(host='0.0.0.0', port=8000)
+    pass
+EOF
+
+  # Nginx configuration
+  ssh -o StrictHostKeyChecking=no -i "$KEY_NAME".pem ubuntu@"$PUBLIC_DNS" "sudo apt install nginx -y"
+  ssh -o StrictHostKeyChecking=no -i "$KEY_NAME".pem ubuntu@"$PUBLIC_DNS" "sudo rm /etc/nginx/sites-enabled/default"
+  cat <<EOF | ssh -o StrictHostKeyChecking=no -i "$KEY_NAME".pem ubuntu@"$PUBLIC_DNS" "sudo tee /etc/nginx/sites-available/$APP_NAME"
+server {
+    listen 80;
+    server_name $PUBLIC_DNS;
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+EOF
+  ssh -o StrictHostKeyChecking=no -i "$KEY_NAME".pem ubuntu@"$PUBLIC_DNS" "sudo ln -s /etc/nginx/sites-available/$APP_NAME /etc/nginx/sites-enabled/$APP_NAME"
+  ssh -o StrictHostKeyChecking=no -i "$KEY_NAME".pem ubuntu@"$PUBLIC_DNS" "sudo systemctl reload nginx"
+
+  # Run the application using Gunicorn
+  ssh -o StrictHostKeyChecking=no -i "$KEY_NAME".pem ubuntu@"$PUBLIC_DNS" "cd /var/www/$APP_NAME && source venv/bin/activate && gunicorn --bind 0.0.0.0:8000 app:app"
+  echo "Application deployed and running at http://$PUBLIC_DNS"
+}
+
+#
+# Main script execution
+#
+if [ -z "$AWS_REGION" ] || [ -z "$AMI_ID" ] || [ -z "$INSTANCE_TYPE" ] || [ -z "$KEY_NAME" ]; then
+  echo "Error: You must set the AWS_REGION, AMI_ID, INSTANCE_TYPE, and KEY_NAME variables."
+  exit 1
+fi
+
+create_security_group
+launch_instance
+configure_server
+
+echo "Done!"
+exit 0
